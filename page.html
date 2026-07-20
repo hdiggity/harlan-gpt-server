@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>harlan-gpt-server __VERSION__</title>
+<style>
+ :root { color-scheme: dark; }
+ body { font-family: -apple-system, system-ui, sans-serif; max-width: 760px;
+   margin: 40px auto; padding: 0 16px; background:#14110f; color:#e8e2d9; }
+ h1 { font-size: 20px; font-weight: 600; }
+ .v { color:#b08d57; font-weight:600; }
+ label { display:block; margin:14px 0 6px; font-size:13px; color:#a89f92; }
+ textarea, input { width:100%; box-sizing:border-box; background:#1e1a17;
+   color:#e8e2d9; border:1px solid #3a332c; border-radius:8px; padding:10px;
+   font-size:15px; }
+ textarea { min-height:70px; resize:vertical; }
+ button { margin-top:14px; background:#b08d57; color:#14110f; border:0;
+   border-radius:8px; padding:10px 18px; font-size:15px; font-weight:600;
+   cursor:pointer; }
+ button:disabled { opacity:.5; cursor:default; }
+ pre { white-space:pre-wrap; word-wrap:break-word; background:#1e1a17;
+   border:1px solid #3a332c; border-radius:8px; padding:12px; margin-top:16px; }
+ .muted { color:#a89f92; font-size:12px; }
+ .link { background:none; border:0; color:#b08d57; cursor:pointer; font-size:12px;
+   padding:0; text-decoration:underline; margin:0; }
+ #status { font-size:12px; color:#8faa8f; margin:10px 0 0; }
+ details { margin-top:12px; } summary { cursor:pointer; color:#a89f92; }
+</style></head><body>
+ <h1>harlan-gpt-server <span class="v">__VERSION__</span></h1>
+ <p class="muted">retrieval-augmented whisky model. answers conversationally,
+   grounded on retrieved review passages. cpu inference, ~30s per answer.</p>
+
+ <!-- shown only until a token is saved on this device -->
+ <div id="signin" hidden>
+   <label for="tok">access token</label>
+   <input id="tok" type="password" placeholder="bearer token"
+     autocomplete="current-password">
+   <button id="save">Save token</button>
+ </div>
+
+ <!-- shown once a token is remembered; token field no longer appears -->
+ <div id="app" hidden>
+   <p id="status">token saved on this device.
+     <button id="change" class="link">change</button></p>
+   <label for="q">question</label>
+   <textarea id="q" placeholder="What does Lagavulin 16 taste like?"></textarea>
+   <button id="go">Ask</button>
+   <pre id="out" hidden></pre>
+   <details id="ret" hidden><summary>retrieved passages</summary>
+     <pre id="rp"></pre></details>
+ </div>
+
+<script>
+// token is remembered in localStorage: entered once, never re-typed. the
+// endpoint still requires it on every POST, so the service stays protected.
+const KEY = 'harlan_gpt_tok';
+const $ = id => document.getElementById(id);
+
+function render() {
+  const tok = localStorage.getItem(KEY);
+  $('signin').hidden = !!tok;
+  $('app').hidden = !tok;
+  (tok ? $('q') : $('tok')).focus();
+}
+
+$('save').addEventListener('click', () => {
+  const v = $('tok').value.trim();
+  if (!v) return;
+  localStorage.setItem(KEY, v);
+  $('tok').value = '';
+  render();
+});
+
+$('change').addEventListener('click', () => {
+  localStorage.removeItem(KEY);
+  render();
+});
+
+async function ask() {
+  const tok = localStorage.getItem(KEY);
+  if (!tok) { render(); return; }
+  const q = $('q').value.trim();
+  if (!q) return;
+  const go = $('go'), out = $('out'), ret = $('ret'), rp = $('rp');
+  go.disabled = true; out.hidden = false; ret.hidden = true;
+  out.textContent = 'thinking (cpu inference, ~30s)...';
+  try {
+    const r = await fetch('/', { method: 'POST',
+      headers: { 'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + tok },
+      body: JSON.stringify({ question: q }) });
+    if (r.status === 401) {
+      out.textContent = '401 unauthorized: token rejected. click change to re-enter.';
+      return;
+    }
+    if (!r.ok) { out.textContent = r.status + ' error'; return; }
+    const d = await r.json();
+    out.textContent = d.answer || '(empty)';
+    if (d.retrieved && d.retrieved.length) {
+      rp.textContent = d.retrieved.join('\n\n---\n\n'); ret.hidden = false;
+    }
+  } catch (e) { out.textContent = 'network error: ' + e; }
+  finally { go.disabled = false; }
+}
+
+$('go').addEventListener('click', ask);
+$('q').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) ask();
+});
+$('tok').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('save').click();
+});
+render();
+</script></body></html>
