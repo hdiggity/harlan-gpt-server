@@ -1,7 +1,7 @@
 # ask_server_v4.py
-# live serving wrapper for the v4.0.0-instruct whisky RAG model. builds the
-# model + whisky bm25 retriever ONCE at startup, then serves questions over
-# http so queries are instant.
+# live serving wrapper for the v4.1.0 (formerly tagged v4.0.0-instruct) whisky
+# RAG model. builds the model + whisky bm25 retriever ONCE at startup, then
+# serves questions over http so queries are instant.
 #
 # key design points:
 #   - bearer-token gate (HARLAN_GPT_TOKEN); the server refuses to start
@@ -50,7 +50,7 @@ TOKENIZER_DIR = os.path.expanduser(
     "~/services/harlan-gpt/whisky-gpt/tokenizer/runs/v3.0.0/drinks-24576"
 )
 
-MODEL_VERSION = "v4.0.0-instruct"
+MODEL_VERSION = "v4.1.0"
 
 # this file lives in scripts/; page.html and .cache/ live at the repo root
 # (one level up), alongside run.sh and .env.

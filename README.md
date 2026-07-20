@@ -1,9 +1,9 @@
 # harlan-gpt-server
 
 HTTP service that serves [harlan-gpt](https://github.com/hdiggity/harlan-gpt)'s
-whisky RAG model (v4.0.0-instruct checkpoint + drinks-24576 tokenizer + BM25
-whisky retriever) behind a Cloudflare Tunnel. Runs CPU-only so it never
-contends with a live MPS training run on the same box.
+whisky RAG model (v4.1.0 instruct checkpoint, formerly tagged v4.0.0-instruct +
+drinks-24576 tokenizer + BM25 whisky retriever) behind a Cloudflare Tunnel.
+Runs CPU-only so it never contends with a live MPS training run on the same box.
 
 This repo is serving code only: no model weights, no corpus, no training code.
 Those live in the (private) model repo and are read in place, never copied
@@ -14,7 +14,7 @@ here or committed to this repo.
 - `ask_server_v4.py` (+ `config.py`, `model.py`, `retriever.py`) build the
   model + BM25 retriever once at startup, then serve queries over HTTP.
 - Large artifacts are **read in place** from the model repo via CLI args:
-  - checkpoint: `<harlan-gpt>/gpt/runs/v4.0.0/finetuning/checkpoints/ckpt.pt`
+  - checkpoint: `<harlan-gpt>/gpt/runs/v4.1.0/checkpoints/ckpt.pt`
   - tokenizer: `<harlan-gpt>/tokenizer/runs/v3.0.0/drinks-24576/` (vocab.json + merges.txt)
   - retrieval corpus: `<harlan-gpt>/gpt/runs/v4.0.0/retrieval/*.jsonl` (304k passages)
 - Binds `127.0.0.1:8799` only. The Cloudflare Tunnel is the only public entry point.
@@ -89,7 +89,7 @@ token once; it's saved in `localStorage` and never retyped, but every POST
 still carries it, so the service stays protected. `page.html` is read fresh
 on each GET, so UI edits are live without restarting the daemon.
 
-## Known limits (v4.0.0-instruct)
+## Known limits (v4.1.0)
 
 Grounding works: the model reads and paraphrases the retrieved passages
 rather than fabricating facts (the v3 regression this model line is built
@@ -99,5 +99,4 @@ around). Two known weaknesses, both v5 training targets, not serving bugs:
 - Some yes-bias on leading yes/no questions (echoes the question's framing
   rather than checking it against the retrieved passages).
 
-See the model repo's `gpt/runs/v4.0.0/finetuning/v4.0.0-instruct.yaml` for
-the full eval writeup.
+See the model repo's `gpt/runs/v4.1.0/v4.1.0.yaml` for the full eval writeup.
