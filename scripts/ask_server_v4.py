@@ -17,8 +17,47 @@
 #
 # served prompt is the EXACT grounded format the finetune trains on:
 #   Instruction: {q}\nReference notes:\n- {p1}\n- {p2}\nResponse:
-# generation stops at the first "\nInstruction:" the model emits.
+# generation stops at the trained <EOS> token (v4.2.0's real end-of-response
+# token, id 24576), with the legacy scaffolding markers (Instruction: /
+# Reference notes: / Response:) kept as a fallback for pre-EOS ckpts and for
+# the rare post-EOS decode where the model leaks prompt scaffolding instead of
+# emitting <EOS> (see the v4.3.4 template-leak fix below).
 # POST {"question": ...} + Authorization: Bearer <token> -> {"answer", "retrieved"}
+#
+# v4.2.0 cutover (2026-07-20): serves the v4.2.0 instruct checkpoint (vocab
+# 24577) with the v3.1.0 tokenizer (drinks-24576 + <EOS>). The tokenizer MUST be
+# loaded via Tokenizer.from_file(tokenizer.json): vocab.json alone has only 24576
+# entries and no <EOS> (it lives only in tokenizer.json's added_tokens), so the
+# old ByteLevelBPETokenizer(vocab.json, merges.txt) loader would encode "<EOS>"
+# as 4 ordinary tokens and the EOS stop would never fire. model.generate() has no
+# stop condition of its own, so the EOS stop lives in generate() below.
+#
+# v4.3.4 cutover (2026-07-24): ckpt v4.2.0 -> v4.3.4 (same base/tokenizer/EOS/
+# RAG format; best fair metrics: matched-len 0.302, decline-aware 0.366,
+# grounded ownership). Live testing surfaced two DECODE-time failures shared by
+# both checkpoints (verified via train/serve prompt diff + head-to-head on the
+# existing 217-item gens: v4.2.0 loops MORE, 6/217 vs v4.3.4's 3/217, so this is
+# not new to v4.3.4 and not a train/serve mismatch):
+#   1. template leak: the model occasionally emits scaffolding text
+#      ("Reference notes:", "Instruction:", "Response:") instead of <EOS>,
+#      continuing as if starting a new training example. FIX: STOP_PATTERNS
+#      below matches these markers ANYWHERE in the decoded text (not just after
+#      a literal "\n" - a mid-text leak without a preceding newline would slip
+#      past a strict prefix match), cutting the answer at the earliest hit.
+#      Safe because 0/3961 v4.3.4 training RESPONSES contain any of these
+#      strings (verified), so a genuine answer never trips this.
+#   2. short-cycle repetition loops ("spicy-spicy-spicy...", "proof US proof US
+#      proof..."): FIX: a no-repeat-ngram filter (NO_REPEAT_NGRAM below) bans
+#      the token that would complete an already-seen n-gram of the ANSWER so
+#      far (never the prompt/refs, so retrieved facts can still be echoed
+#      once). n=4 chosen over the more aggressive n=3 after eyeballing an A/B
+#      (see scratchpad/ab_ngram_test.py): n=3 risked suppressing legitimate
+#      domain repeats ("ex-bourbon" twice, a distillery name recurring); n=4
+#      still catches both short-cycle loops above (they repeat far more than
+#      once) while leaving natural phrasing alone.
+# These are DECODE-time fixes only; no model/checkpoint change. They do not
+# touch the discrimination failure (yes-bias / unreliable refusal) still
+# present in v4.3.4 - that is the capacity question v4.4.x is testing.
 
 import argparse
 import glob
@@ -27,6 +66,7 @@ import hmac
 import json
 import os
 import pickle
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import config
@@ -38,19 +78,19 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from model import GPT  # noqa: E402
 from retriever import WhiskyRetriever  # noqa: E402
-from tokenizers import ByteLevelBPETokenizer  # noqa: E402
+from tokenizers import Tokenizer  # noqa: E402
 
 CKPT_DIR_DEFAULT = os.path.expanduser(
-    "~/services/harlan-gpt/whisky-gpt/gpt/runs/v4.1.0/checkpoints"
+    "~/services/harlan-gpt/whisky-gpt/gpt/runs/v4.3.4/checkpoints"
 )
 RETRIEVAL_DIR_DEFAULT = os.path.expanduser(
     "~/services/harlan-gpt/whisky-gpt/gpt/runs/v4.0.0/retrieval"
 )
 TOKENIZER_DIR = os.path.expanduser(
-    "~/services/harlan-gpt/whisky-gpt/tokenizer/runs/v3.0.0/drinks-24576"
+    "~/services/harlan-gpt/whisky-gpt/tokenizer/runs/v3.1.0/drinks-24576-eos"
 )
 
-MODEL_VERSION = "v4.1.0"
+MODEL_VERSION = "v4.3.4"
 
 # this file lives in scripts/; page.html and .cache/ live at the repo root
 # (one level up), alongside run.sh and .env.
@@ -70,15 +110,55 @@ CACHE_DIR = os.path.join(REPO_ROOT, ".cache")
 # refuses to start without it, so it never serves unauthenticated.
 AUTH_TOKEN = os.environ.get("HARLAN_GPT_TOKEN", "").strip()
 
-STOP_MARKER = "\nInstruction:"  # model echoing a new prompt = end of answer
+# scaffolding markers: any of these appearing ANYWHERE in the decoded answer
+# means the model is echoing prompt structure rather than answering (fallback
+# for pre-EOS ckpts; a safety net for post-EOS ckpts that occasionally leak
+# scaffolding instead of emitting <EOS>). whitespace-tolerant (re.search, not a
+# literal "\n"-prefixed substring) so a leak that renders without a preceding
+# newline still gets caught. safe: 0/3961 v4.3.4 training responses contain
+# any of these strings, so a genuine answer never trips this.
+STOP_PATTERNS = [re.compile(p) for p in
+                 (r"\s*Instruction:", r"\s*Reference notes:", r"\s*Response:")]
 PROMPT_MARGIN = 8  # tokens of slack for encode-concat boundary effects
 MIN_SNIPPET_TOKENS = 24  # skip a truncated ref shorter than this
+# short-cycle repetition guard (v4.3.4 cutover): ban the token that would
+# complete an already-seen n-gram of the GENERATED answer so far. n=4 chosen
+# over n=3 after an A/B (scratchpad/ab_ngram_test.py) - n=3 risked blocking
+# legitimate domain repeats ("ex-bourbon" twice, a recurring distillery name);
+# n=4 still catches the observed loops (spicy-spicy-spicy, proof US proof US
+# proof), which cycle far more than once. 0 disables the filter.
+NO_REPEAT_NGRAM = 4
+
+
+def _find_stop(text):
+    # earliest match across all scaffolding patterns, or None.
+    starts = []
+    for pat in STOP_PATTERNS:
+        m = pat.search(text)
+        if m:
+            starts.append(m.start())
+    return min(starts) if starts else None
+
+
+def _ban_repeat_ngrams(logits, gen_ids, n):
+    # gen_ids: token ids of the ANSWER so far (never the prompt/refs), so a
+    # retrieved fact can still be echoed once without being blocked. bans the
+    # next token if it would repeat an n-gram already seen in gen_ids.
+    if n <= 0 or len(gen_ids) < n - 1:
+        return logits
+    prefix = tuple(gen_ids[-(n - 1):])
+    banned = {gen_ids[i + n - 1] for i in range(len(gen_ids) - n + 1)
+              if tuple(gen_ids[i:i + n - 1]) == prefix}
+    for t in banned:
+        logits[0, t] = float("-inf")
+    return logits
 
 # globals loaded once at startup
 MODEL = None
 TOK = None
 RETRIEVER = None
 BLOCK_SIZE = None
+EOS_TOKEN_ID = None  # v4.2.0: trained end-of-response token; None for pre-EOS ckpts
 GEN_DEFAULTS = {
     "top_k": 5,
     "max_new_tokens": 300,
@@ -113,7 +193,9 @@ def load_checkpoint(ckpt_dir):
         )
     model.to(config.device)
     model.eval()
-    return model, mc.block_size
+    # v4.2.0 ckpts carry eos_token_id; pre-EOS ckpts (v4.1.0) do not -> None.
+    eos_token_id = ckpt.get("eos_token_id")
+    return model, mc.block_size, eos_token_id
 
 
 def _corpus_fingerprint(retrieval_dir):
@@ -193,7 +275,8 @@ def build_prompt(question, passages, max_new_tokens):
 
 
 @torch.no_grad()
-def generate(prompt, max_new_tokens, temperature, gen_top_k):
+def generate(prompt, max_new_tokens, temperature, gen_top_k,
+              no_repeat_ngram=NO_REPEAT_NGRAM):
     ids = TOK.encode(prompt).ids
     if len(ids) > BLOCK_SIZE:
         ids = ids[-BLOCK_SIZE:]  # safety net; build_prompt budgets against this
@@ -203,16 +286,28 @@ def generate(prompt, max_new_tokens, temperature, gen_top_k):
         x_cond = x[:, -BLOCK_SIZE:]
         logits, _ = MODEL(x_cond)
         logits = logits[:, -1, :] / temperature
+        gen_ids = x[0, start_len:].tolist()
+        logits = _ban_repeat_ngrams(logits, gen_ids, no_repeat_ngram)
         if gen_top_k is not None:
             v, _ = torch.topk(logits, min(gen_top_k, logits.size(-1)))
             logits[logits < v[:, [-1]]] = float("-inf")
         probs = F.softmax(logits, dim=-1)
         nxt = torch.multinomial(probs, num_samples=1)
+        # primary stop: the trained <EOS> token. checked by TOKEN ID (cheap, and
+        # correct: TOK.decode() drops the special token so a string match can't
+        # see it). do NOT append it; the answer is everything generated so far.
+        if EOS_TOKEN_ID is not None and int(nxt.item()) == EOS_TOKEN_ID:
+            return TOK.decode(x[0, start_len:].tolist())
         x = torch.cat((x, nxt), dim=1)
-        # stop condition: cut at the first "\nInstruction:" the model emits
+        # fallback stop: cut at the earliest scaffolding marker the model
+        # emits (the only stop for pre-EOS ckpts; a safety net once EOS is
+        # trained, and the fix for the v4.3.4 template-leak: a leaked
+        # "Reference notes:"/"Instruction:"/"Response:" now truncates the
+        # answer instead of running to max_new_tokens).
         text = TOK.decode(x[0, start_len:].tolist())
-        if STOP_MARKER in text:
-            return text.split(STOP_MARKER)[0]
+        stop = _find_stop(text)
+        if stop is not None:
+            return text[:stop]
     return TOK.decode(x[0, start_len:].tolist())
 
 
@@ -293,7 +388,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global MODEL, TOK, RETRIEVER, BLOCK_SIZE
+    global MODEL, TOK, RETRIEVER, BLOCK_SIZE, EOS_TOKEN_ID
     if not AUTH_TOKEN:
         raise SystemExit("refusing to start: HARLAN_GPT_TOKEN env var is not set")
     p = argparse.ArgumentParser()
@@ -311,16 +406,28 @@ def main():
     torch.manual_seed(args.seed)
 
     print("loading model (cpu) ...")
-    MODEL, BLOCK_SIZE = load_checkpoint(args.ckpt_dir)
-    TOK = ByteLevelBPETokenizer(
-        os.path.join(args.tokenizer_dir, "vocab.json"),
-        os.path.join(args.tokenizer_dir, "merges.txt"),
-    )
+    MODEL, BLOCK_SIZE, EOS_TOKEN_ID = load_checkpoint(args.ckpt_dir)
+    # v3.1.0: load the full tokenizer.json (has <EOS> in added_tokens); NOT
+    # vocab.json+merges.txt, which lack the special token (see header note).
+    TOK = Tokenizer.from_file(os.path.join(args.tokenizer_dir, "tokenizer.json"))
+    # fail loudly if the tokenizer and checkpoint disagree about <EOS>: a silent
+    # mismatch here would defeat the entire EOS stop.
+    if EOS_TOKEN_ID is not None:
+        vs = TOK.get_vocab_size()
+        assert vs == EOS_TOKEN_ID + 1, (
+            f"tokenizer vocab {vs} != eos_token_id+1 {EOS_TOKEN_ID + 1}; "
+            "wrong tokenizer for this checkpoint"
+        )
+        assert TOK.encode("<EOS>").ids == [EOS_TOKEN_ID], (
+            f"<EOS> did not encode to [{EOS_TOKEN_ID}]: {TOK.encode('<EOS>').ids}; "
+            "wrong tokenizer loader (vocab.json has no <EOS>)"
+        )
 
     print("building whisky retriever (once) ...")
     RETRIEVER = build_retriever(args.retrieval_dir, args.hybrid)
 
-    print(f"ready. serving {MODEL_VERSION} on 127.0.0.1:{args.port}")
+    print(f"ready. serving {MODEL_VERSION} (eos={EOS_TOKEN_ID}) "
+          f"on 127.0.0.1:{args.port}")
     HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
 
